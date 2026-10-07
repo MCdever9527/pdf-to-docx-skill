@@ -66,8 +66,10 @@ def main() -> int:
     print("-" * 68)
 
     # 1) 依赖
-    missing_req = [d["pip"] for d in report["missing_required"]]
-    missing_opt = [d["pip"] for d in report["missing_optional"]]
+    # env_report() 已经在这两项里归约成 pip 名称列表（见 _runtime.env_report），
+    # 这里不能再按 dict 取值，否则会 TypeError: string indices must be integers。
+    missing_req = list(report["missing_required"])
+    missing_opt = list(report["missing_optional"])
     if not missing_req:
         print("✓ 必需依赖齐全")
     else:

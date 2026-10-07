@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -179,7 +180,125 @@ def patch_default_font(doc: Document, latin: str, east_asian: str, size_pt: floa
         sz.set(qn("w:val"), str(int(round(size_pt * 2))))
 
 
+# ------------------------------------------------------------------ 页眉页脚
+
+def _field_run(paragraph, instr: str, size_pt: float | None = None,
+               latin: str = "Times New Roman", east_asian: str = "宋体"):
+    """插入 Word 域（如 PAGE / NUMPAGES）——域必须由 fldChar 序列构成。"""
+    run = paragraph.add_run()
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    instr_el = OxmlElement("w:instrText")
+    instr_el.set(qn("xml:space"), "preserve")
+    instr_el.text = instr
+    sep = OxmlElement("w:fldChar")
+    sep.set(qn("w:fldCharType"), "separate")
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+    for el in (begin, instr_el, sep, end):
+        run._element.append(el)
+    if size_pt:
+        run.font.size = Pt(size_pt)
+    set_east_asian_font(run, latin, east_asian)
+    return run
+
+
+_ALIGN_MAP = {
+    "center": WD_ALIGN_PARAGRAPH.CENTER,
+    "right": WD_ALIGN_PARAGRAPH.RIGHT,
+    "left": WD_ALIGN_PARAGRAPH.LEFT,
+    "justify": WD_ALIGN_PARAGRAPH.JUSTIFY,
+}
+
+
+def _write_fields(para, fmt: str, size_pt, latin: str, ea: str,
+                  bold: bool = False, color: str | None = None) -> None:
+    """把含 {PAGE} / {NUMPAGES} 占位符的模板写进段落，普通文字走 run，占位符走域。"""
+    for tok in re.split(r"(\{PAGE\}|\{NUMPAGES\})", fmt):
+        if not tok:
+            continue
+        if tok == "{PAGE}":
+            r = _field_run(para, " PAGE ", size_pt, latin, ea)
+        elif tok == "{NUMPAGES}":
+            r = _field_run(para, " NUMPAGES ", size_pt, latin, ea)
+        else:
+            r = para.add_run(tok)
+            if size_pt:
+                r.font.size = Pt(size_pt)
+            set_east_asian_font(r, latin, ea)
+        if bold:
+            r.bold = True
+        if color:
+            r.font.color.rgb = RGBColor.from_string(color.lstrip("#"))
+
+
+def set_header(section, spec_header: dict) -> None:
+    """写页眉。文本里的 {PAGE}/{NUMPAGES} 会转成域，所以页码能自动跟随。
+
+    字段：text(或 format) / size_pt / bold / color / align / border_bottom
+    """
+    if not spec_header:
+        return
+    header = section.header
+    header.is_linked_to_previous = False
+    para = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
+    for r in list(para.runs):
+        r._element.getparent().remove(r._element)
+
+    fmt = spec_header.get("text") or spec_header.get("format") or ""
+    _write_fields(para, fmt,
+                  spec_header.get("size_pt"),
+                  spec_header.get("latin", "Times New Roman"),
+                  spec_header.get("east_asian", "宋体"),
+                  spec_header.get("bold", False),
+                  spec_header.get("color"))
+    para.alignment = _ALIGN_MAP.get(spec_header.get("align", "center"),
+                                    WD_ALIGN_PARAGRAPH.CENTER)
+    if spec_header.get("border_bottom"):
+        bottom_border(para, spec_header["border_bottom"],
+                      spec_header.get("border_size", 4))
+
+
+def set_footer_page_number(section, spec_footer: dict) -> None:
+    """写页脚页码：{format, size_pt, align}；format 如 'Page {PAGE} of {NUMPAGES}'。"""
+    if not spec_footer:
+        return
+    footer = section.footer
+    footer.is_linked_to_previous = False
+    para = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+    for r in list(para.runs):
+        r._element.getparent().remove(r._element)
+
+    _write_fields(para,
+                  spec_footer.get("text") or spec_footer.get("format") or "{PAGE}",
+                  spec_footer.get("size_pt"),
+                  spec_footer.get("latin", "Times New Roman"),
+                  spec_footer.get("east_asian", "宋体"),
+                  spec_footer.get("bold", False),
+                  spec_footer.get("color"))
+    para.alignment = _ALIGN_MAP.get(spec_footer.get("align", "center"),
+                                    WD_ALIGN_PARAGRAPH.CENTER)
+
+
 # ------------------------------------------------------------------ 高度预算
+
+def estimate_lines(text: str, size_pt: float, avail_width_pt: float) -> int:
+    """估算段落折行后的行数。
+
+    这一步是高度预算准确的前提：spec 里给的 lines 往往是「逻辑行数」，
+    而 Word 会按版心宽度自动折行。若按 1 行估算，长段落会被严重低估，
+    预算失效，内容一路溢出到后面所有页。
+    """
+    if not text:
+        return 1
+    cjk = sum(1 for ch in text if ord(ch) > 0x2E80)
+    latin = max(len(text) - cjk, 0)
+    # 经验字宽：拉丁约 0.5em，CJK 约 1.0em
+    width = (latin * 0.5 + cjk * 1.0) * size_pt
+    if avail_width_pt <= 1:
+        return 1
+    return max(1, math.ceil(width / avail_width_pt))
+
 
 def apply_height_budget(spec: dict, page: dict, safety: float = 0.995) -> dict:
     """按页做高度预算，保证重建高度贴合原页实测高度。
@@ -188,14 +307,17 @@ def apply_height_budget(spec: dict, page: dict, safety: float = 0.995) -> dict:
     重建时多出的一点点间距就会把末尾几行挤到下一页；一旦有一页溢出，
     后面所有页与原页的对应关系就全乱了。
 
-    目标高度优先用「原页内容实测高度」（extract 已量出）。它比单纯用页面
-    可用高度更准：内容少的页本就排不满，不该被拉伸，也不该被无谓压缩。
+    目标高度优先用「原页内容实测高度」。它比单纯用页面可用高度更准：
+    内容少的页本就排不满，不该被拉伸，也不该被无谓压缩。
 
     压缩优先级：先压段后间距（视觉影响小），仍不够才动行距（影响观感）。
     """
     margins = page.get("margins_pt") or {}
-    avail = (page.get("height_pt", 841.89)
-             - margins.get("top", 72.0) - margins.get("bottom", 72.0))
+    left = margins.get("left", 72.0)
+    right = margins.get("right", 72.0)
+    avail = page.get("height_pt", 841.89) - margins.get("top", 72.0) - \
+        margins.get("bottom", 72.0)
+    avail_w = max(page.get("width_pt", 595.28) - left - right, 1.0)
 
     # 每页的原页实测内容高度
     targets = {pm["index"]: pm.get("content_h_pt") for pm in spec.get("page_meta", [])}
@@ -217,7 +339,20 @@ def apply_height_budget(spec: dict, page: dict, safety: float = 0.995) -> dict:
         if not flow:
             continue
 
-        fixed = sum(b.get("lines", 1) * (b["style"].get("line_pt") or 14.0) for b in flow)
+        # 逐段按「折行后的实际行数」累加高度，这是预算准不准的关键
+        fixed = 0.0
+        for b in flow:
+            size = b["style"].get("size_pt") or 11.0
+            line_pt = b["style"].get("line_pt") or (size * 1.4)
+            indent = b.get("indent_pt") or b["style"].get("left_indent_pt") or 0.0
+            declared = b.get("lines")
+            if isinstance(declared, int) and declared > 1:
+                n = declared
+            else:
+                n = estimate_lines(b.get("text", ""), size,
+                                   max(avail_w - indent, 20.0))
+            fixed += n * line_pt
+
         var = sum(b["style"].get("space_after_pt", 0.0) for b in flow)
         need = fixed + var
 
@@ -259,8 +394,15 @@ BULLET_RE = re.compile(r"^(\s*)[-*+•·]\s+(.*)$")
 NUMBERED_RE = re.compile(r"^(\s*)(\d+)[.)、]\s+(.*)$")
 
 
+def _add_tab(paragraph):
+    """在 run 文本里，制表符必须是 <w:tab/> 元素，直接塞 \\t 字符不生效。"""
+    run = paragraph.add_run()
+    run._element.append(OxmlElement("w:tab"))
+    return run
+
+
 def add_runs(paragraph, text: str, base: dict) -> None:
-    """支持 **粗体** / *斜体* 的内联标记，逐段生成 run。"""
+    """支持 **粗体** / *斜体* 的内联标记，逐段生成 run；\\t 转成真制表符。"""
     tokens = re.split(r"(\*\*[^*]+\*\*|\*[^*]+\*)", text)
     for tok in tokens:
         if not tok:
@@ -270,20 +412,37 @@ def add_runs(paragraph, text: str, base: dict) -> None:
             bold, body = True, tok[2:-2]
         elif tok.startswith("*") and tok.endswith("*") and len(tok) > 2:
             italic, body = True, tok[1:-1]
-        run = paragraph.add_run(body)
-        run.bold = bold
-        run.italic = italic
-        if base.get("color"):
-            run.font.color.rgb = RGBColor.from_string(base["color"].lstrip("#"))
-        if base.get("size_pt"):
-            run.font.size = Pt(base["size_pt"])
-        set_east_asian_font(run, base.get("latin", "Arial"), base.get("east_asian", "微软雅黑"))
+
+        # 按制表符切分：文字走 run，间隔走 w:tab
+        for i, seg in enumerate(body.split("\t")):
+            if i > 0:
+                _add_tab(paragraph)
+            if not seg:
+                continue
+            run = paragraph.add_run(seg)
+            run.bold = bold
+            run.italic = italic
+            if base.get("underline"):
+                run.underline = True
+            if base.get("color"):
+                run.font.color.rgb = RGBColor.from_string(base["color"].lstrip("#"))
+            if base.get("size_pt"):
+                run.font.size = Pt(base["size_pt"])
+            set_east_asian_font(run, base.get("latin", "Arial"),
+                                base.get("east_asian", "微软雅黑"))
 
 
 def build_from_blocks(doc: Document, spec: dict) -> dict:
     stats = {"paragraphs": 0, "headings": 0, "tables": 0, "images": 0,
              "bullets": 0, "sections": 1}
     page_cfg = spec.get("page") or {}
+    header_cfg = spec.get("header") or {}
+    footer_cfg = spec.get("footer") or {}
+
+    # 首页的页眉页脚；后续分节默认链接到上一节，因此自动继承
+    if doc.sections:
+        set_header(doc.sections[0], header_cfg)
+        set_footer_page_number(doc.sections[0], footer_cfg)
 
     for block in spec.get("blocks", []):
         kind = block.get("kind", "paragraph")
@@ -315,6 +474,13 @@ def build_from_blocks(doc: Document, spec: dict) -> dict:
                 tr = table.rows[0]._tr
                 trPr = tr.get_or_add_trPr()
                 trPr.append(_el("w:tblHeader", val="true"))
+            # 列宽（pt）：不指定时交给 Word 自适应
+            widths = block.get("col_widths_pt")
+            if widths:
+                for ci in range(min(len(widths), ncols)):
+                    w = Pt(widths[ci])
+                    for row in table.rows:
+                        row.cells[ci].width = w
             stats["tables"] += 1
             continue
 
@@ -364,6 +530,7 @@ def build_from_blocks(doc: Document, spec: dict) -> dict:
         base = {
             "bold": bool(style.get("bold")) or level >= 1,
             "italic": bool(style.get("italic")),
+            "underline": bool(style.get("underline")),
             "size_pt": style.get("size_pt"),
             "color": style.get("color"),
             "latin": style.get("latin", "Arial"),

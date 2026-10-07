@@ -1,7 +1,7 @@
 ---
 name: pdf-to-docx
 description: 把 PDF 高保真重建为可编辑的 .docx，覆盖文字型、图片型（扫描件/图形页）与混合型。当用户要求「PDF 转 Word」「PDF 转 docx」「保持原格式」「扫描件转 Word」「照着 PDF 重建文档」或格式被转码工具搞乱需要重做时使用。
-version: 1.0.0
+version: 1.1.0
 ---
 
 # PDF → Word 高保真重建
@@ -21,6 +21,9 @@ version: 1.0.0
 | 4 | **渲染-比对-迭代** | 生成后**渲染回图**，与原 PDF 逐页比对，测出偏差再改。这一步最常被忽略，却是「保得住格式」的分水岭。 |
 
 本技能把这四条固化成可执行的脚本流水线。
+
+> 机制 1 有个**速度陷阱**：把「看图」当成主要信息通道。看图很贵（每次都是多模态往返），
+> 正确的用法是**抽查**而不是通读。第九节的效率纪律把这一点量化为可执行的几条规则。
 
 ## 二、安装与分发（换一台机器也能跑）
 
@@ -91,14 +94,31 @@ Python 侧（由 bootstrap 安装到当前运行时）：
 用 Word 本体渲染，是因为验收要回答「这份 docx 在 Word 里打开长什么样」——
 换任何第三方渲染器，分页与字体回退的差异都会掩盖真实问题。
 
+脚本清单（`scripts/`）：
+
+| 脚本 | 一句话 |
+|---|---|
+| `bootstrap.py` | 自检 / 安装依赖，写出 `env.json` |
+| `probe.py` | 分诊：逐页判 `text` / `mixed` / `image` / `scanned` / `vector` |
+| `extract.py` | 文字层 span → 行 → 段落 → 块（+ 抽正文图） |
+| `render_pages.py` | 整页渲染成图（版式判读用） |
+| `ocr.py` / `ocr_to_spec.py` | 图片型 OCR 初稿 → 结构规格 |
+| **`verify_sheet.py`** | **把待确认行带拼成 1~2 张长图，一次看完** |
+| **`prespec.py`** | **渲染前的页面高度 / 折行预检（纯算术，不启动 Word）** |
+| `build_docx.py` | 结构 → 真 OOXML（页面尺寸/字体/缩进/高度预算） |
+| `render_docx.ps1` / `render_docx.py` | docx → PDF（Word COM，降级 LibreOffice） |
+| `compare.py` | 逐页数值比对 + 并排对照图 + 差异热图 |
+| `measure_ink.py` / `diag_fit.py` / `diag_lines.py` | 版面度量与高度诊断 |
+
 ## 五、流程
 
 ```
-Phase 0  分诊      probe.py          → 判定类型，选路线
-Phase 1  取素材    extract.py / render_pages.py
-Phase 2  定结构    几何事实 + 视觉判读（+ OCR）
-Phase 3  生成      build_docx.py     → .docx
-Phase 4  验收      render_docx.ps1 → compare.py → 迭代
+Phase 0  分诊      probe.py                      → 判定类型，选路线
+Phase 1  取素材    render_pages.py + ocr.py      → 全页图 + OCR 初稿（并行开）
+Phase 2  定结构    测量脚本一次成型 + verify_sheet.py 拼版校对
+Phase 3  预检      prespec.py                   → 渲染前拦下溢出
+Phase 4  生成      build_docx.py                → .docx
+Phase 5  验收      render_docx.ps1 → compare.py  → 按需迭代
 ```
 
 ### Phase 0 · 分诊
@@ -129,17 +149,15 @@ python <skill>/scripts/extract.py in.pdf --out blocks.json [--images imgs/]
 
 抽出 span 级 `(text, font, size, color, bbox, flags)`，再聚成 行 → 段落 → 文档块。
 
-**路线 C/D（无文字层）**——先把页面变成我能看的东西：
+**路线 C/D（无文字层）**——两条通道**并行开**，不要串行：
 
 ```bash
-python <skill>/scripts/render_pages.py in.pdf --outdir pages/ --dpi 160 --tile
+python <skill>/scripts/render_pages.py in.pdf --outdir pages/ --dpi 160 --tile   # 通道一：整页图
+python <skill>/scripts/ocr.py in.pdf --out ocr.json --dpi 200                     # 通道二：全文 + 坐标
 ```
 
-然后**逐页 read_image 看图**。同时跑 OCR 拿坐标：
-
-```bash
-python <skill>/scripts/ocr.py in.pdf --out ocr.json --dpi 200
-```
+整页图**只用来看版面结构**（几栏、哪里是表格、层级如何），不要用它去抠每一个词。
+术语与拼写交给下面的拼版校对。
 
 ### Phase 2 · 定结构（关键分工）
 
@@ -155,6 +173,27 @@ python <skill>/scripts/ocr.py in.pdf --out ocr.json --dpi 200
 
 **融合规则：视觉决定「是什么」，OCR/几何决定「在哪、多大」。**
 
+#### 证词要用拼版一次取（别一行一行裁）
+
+OCR 会写错专业词，所以必须人眼复核——但**复核要一次做完**。把待确认的行带
+拼成一张长图，一次 `read_image` 看完：
+
+```bash
+python <skill>/scripts/verify_sheet.py in.pdf --auto 1,3 --outdir sh/          # 自动切行带
+python <skill>/scripts/verify_sheet.py in.pdf \
+       --at "1:93:112:P1 caption" --at "3:675:710:P3 sub-a" --outdir sh/       # 手工给点
+python <skill>/scripts/verify_sheet.py in.pdf --spec regions.json --outdir sh/ # 批量给点
+```
+
+产出 `sh/sheet_001.png`（每格左侧有 `#序号` 标尺）与 `sh/verify_map.json`
+（序号 → 页码 / y 区间 / 标签，看图时对照）。单张超过 `--max-side` 会自动分张。
+
+> 反面教材：一次 5 页公文的实测里，**逐行裁剪 + 逐行读图共 35 次调用**，
+> 其中为了确认一个词（`Liquidating` 还是 `Liqudating`）裁了 **6 次**——而且最早那张
+> 低分辨率裁剪给出的是**错读**。同样的事拼成一张图只需 1 次。
+
+#### 产出物
+
 图片型 PDF 的推荐产出物不是 blocks.json，而是**我直接写的 Markdown 重建稿**，
 然后把页面几何交给 `build_docx.py` 的 `--preset`：
 
@@ -164,7 +203,36 @@ python <skill>/scripts/build_docx.py rebuild.md out.docx --preset page.json
 
 （Markdown 里的 `##` → 色块标题，`-` → 列表，`|` → 真表格。）
 
-### Phase 3 · 生成
+版面复杂到 Markdown 表达不了时（边框盒、单元格底纹、制表位对齐、域），
+就写一份显式的 blocks.json，或按 `build_docx.py` 的 `build_from_blocks` 契约
+自己直写 OOXML——技能不强制走引擎。
+
+### Phase 3 · 预检（渲染前，纯算术）
+
+在启动 Word 之前先算一遍高度预算——这一步专门用来**省掉最贵的往返**：
+
+```bash
+python <skill>/scripts/prespec.py spec.json --preset page.json -v
+```
+
+它按与 `build_docx.py` 完全相同的口径估算每一页：
+
+```
+每页需要高度 = Σ(各段折行数 × 行距) + (段数 − 1) × 段后间距
+```
+
+再与「目标高度」（优先取原页实测内容高度 `page_meta[].content_h_pt`，
+退而用页面可用高度）比对，给出 `ok` / `tight` / `overflow`，以及该压哪个参数：
+
+```
+   页 判定          块    行       固定      间距       需要       目标  建议
+   1 overflow   20   52    882.4   136.3   1018.7    522.4  line_pt × 0.592（并置 space_after=0）
+结论: ok=0 tight=0 overflow=1  共 1 页
+```
+
+退出码 1 表示有页溢出——**先改内容或版式，再渲染**。`-v` 展开最紧张那页的逐段明细。
+
+### Phase 4 · 生成
 
 `build_docx.py` 负责把结构写成真 OOXML。三个决定成败的细节：
 
@@ -176,7 +244,7 @@ python <skill>/scripts/build_docx.py rebuild.md out.docx --preset page.json
    引擎因此按页估算高度并对段后间距做等比收缩；分页用**分节**（section break）
    而非分页符，切断级联误差。
 
-### Phase 4 · 验收（不能省）
+### Phase 5 · 验收（不能省）
 
 ```bash
 pwsh -NoProfile -File <skill>/scripts/render_docx.ps1 -InFile out.docx -OutFile out.pdf
@@ -195,8 +263,13 @@ python <skill>/scripts/compare.py in.pdf out.pdf --outdir diff/
 | `pixel_hot_ratio` | **版面**接近程度 | ≤ 0.20 正常 |
 | 页数一致 | 分页有没有漂 | 必须相等 |
 
+> **图片型 / 扫描件的 `text_similarity` 恒为 `N/A`**：原文没有文字层，取不到基准。
+> `compare.py` 会把该指标标成 `N/A` 并**只按版面接近度判定**（≤10% pass，≤25% warn），
+> 同时在结论下方打印一行说明。若输出里看到的是 `0.000` 而不是 `N/A`，
+> 说明跑的是旧版脚本——那是一个「无法评估」被误报成「内容全错」的假指标。
+
 像素差异**永远不可能为 0**：换行位置、字体渲染、微调间距都会产生差异。
-拿像素差当唯一标准会陷入无意义的追打；**内容相似度才是硬指标**。
+拿像素差当唯一标准会陷入无意义的追打；有文字层时**内容相似度才是硬指标**。
 
 实测基准（一份 6 页文字型简历，612×792pt）：
 
@@ -210,6 +283,12 @@ python <skill>/scripts/compare.py in.pdf out.pdf --outdir diff/
 页 6  相似度 0.992  像素差  3.7%
 ```
 
+实测基准（一份 5 页扫描件公文，552×765pt，无文字层）：
+
+```
+页 1..5  像素差 8.3% / 8.7% / 9.0% / 8.5% / 4.1%   文本相似 N/A（原文无文字层）
+```
+
 ## 七、踩过的坑（都是实测出来的，别重犯）
 
 - **页边距不能按「第一页最后一行的位置」推**。内容少的页天然排不满，
@@ -221,14 +300,41 @@ python <skill>/scripts/compare.py in.pdf out.pdf --outdir diff/
 - **行距≠行高**。用 `行高 × 1.32` 估行距会偏大（实测 17.03 vs 真实 14.88），
   足已把满页内容挤到下一页。行距应当直接量**相邻行 y0 的差值**。
 - **段后间距属于「前一段」，不是后一段**。挂反了标题后面就会贴住正文。
+- **段后间距要按「行框跨度」反推，别按墨迹顶反推**。墨迹顶受首字符影响
+  （大写/括号/无升部字母各不相同），实测同一份文件里能算出 12.8 / 14.7 / 15.7
+  三个值。用「折行数 × 行距 + (段数 − 1) × 段距 = 行框跨度」整体解，才收敛到 12.8。
 - **PDF 常把项目符号「•」单独放一行**，与文字行分成两个对象。
   只按行首字符判列表会得到一堆孤立的 `•`。要按几何关系合并：
   符号行 x0 更小、文字行更深，差值就是悬挂缩进宽度。
+- **扫描件各页之间常有平移错位**，别拿单页去定版心。判断方法很便宜：
+  页码是居中的，用各页页码中心反解出每页平移量；归到同一坐标系后，
+  所有元素的左边界应当落在**等距的缩进梯级**上。实测奇偶页错位 ±23.5pt，
+  归位后梯级干净地落在 44/62/80/98/116（步长 18pt = 0.25″）——这才证明版式是齐的。
+- **Word 默认不做字距调整（kerning），源文档往往做了**。差之毫厘：整行比原件宽约
+  0.5%，而原件里「贴边」的行（离版心右缘不足 1pt）就会提前断行、多出一行，
+  进而把整页挤到溢出。修法：给 `w:rPr` 加 `<w:kern w:val="8"/>`（**docDefaults 也要加**）。
+  仍不够时再把版心放宽几 pt——**版心宽度一致比页边距好看更重要**。
+- **表格单元格里模板自带的那个空段落会毁掉盒子几何**。
+  `cell.paragraphs[0]` 带的是 Normal 样式（1.15 倍行距 + 8pt 段后），留着它，
+  边框盒会凭空高出一大截（实测盒子从 84pt 涨到 126pt）。填内容前先删掉它。
+- **跨页的段落要按原件的断点人工切分**。原 PDF 常在段落中间分页；若把整段整体
+  放进前一节，末几行会被顶到下一页，连带后面所有页错位。切成「前半段 + 续段」，
+  续段沿用原件的悬挂缩进即可。
+- **用表格排双栏落款会整块跳页**。Word 的行不能被拆时会把整个表推到下一页；
+  改成「左缩进 + 制表位」的普通段落，两栏照样对齐，还不会跳。
+- **标签与取值之间是对齐到制表位，不是空格**。原件用的就是 Word 默认的 0.5″
+  制表网格（从版心左缘起算）：`Objection Deadline:` 落到 144pt、`Responses:` → 108pt、
+  `Status:` 要补两个空格才够到 108pt——把三个都量出来，规律就自明，照抄即对齐。
+  另外**下划线只给标签，不要覆盖补位的空格**。
 - **PowerShell 参数别用 `$Input`**——它是自动变量，会导致取到空值。
 - **`pwsh -File` 里不要指望 `ExportAsFixedFormat` 的参数绑定**，
   12 个可选参数在 PS 下不稳，用 `SaveAs2($path, 17)`。
 - **PyMuPDF ≥1.28 的 `get_pixmap(dpi=)` 只接受 int**，传 float 抛 TypeError。
 - **控制台中文乱码**：脚本开头要 `sys.stdout.reconfigure(encoding="utf-8")`。
+- **`bootstrap.py` 曾崩在 `report["missing_required"]`**：`_runtime.env_report()`
+  已把这两项归约成 pip 名称**字符串列表**，`bootstrap` 却按 dict 取值
+  （`[d["pip"] for d in ...]`）→ `TypeError: string indices must be integers`。
+  改 `env_report` 或改调用方都行，但**别只改一边**——这是两个文件之间的隐式契约。
 
 ## 八、图片型 PDF 的额外注意
 
@@ -240,11 +346,54 @@ python <skill>/scripts/compare.py in.pdf out.pdf --outdir diff/
 - **正文照片要抽原图**（`extract.py --images`），不要截屏，否则清晰度会掉。
 - **专业术语务必用视觉复核 OCR 结果**：`ISO55000`、`FSOE`、`SMIEEE`、`CEnv`
   这类缩写，OCR 极易写错，而错一个字符整份文档的专业度就打了折扣。
+  ——复核走 `verify_sheet.py`，一次看一批。
+- **合成扫描件要当心**：有的 PDF 是「低分辨率整页底图 + 若干高清文字行贴片」拼出来的。
+  `probe.py` 会把它判成 `image`（确实没有文字层），但 `get_images()` 能看出结构。
+  这种文件的文字清晰度不均匀，**别按底图的 dpi 去判断可读性**。
+- **页数对不上先看是不是空白页**：扫描件常多出一页背面空白。若原件第 N 页零墨迹
+  而文档自带的页眉写着 "Page x of N−1"，就按 N−1 出——**并在交付时说明**，
+  不要默默少一页。
 
-## 九、局限（诚实说明）
+## 九、效率纪律（实测：50 分钟 → 15 分钟量级）
+
+一次 5 页扫描件公文的重建实测：**50 分 18 秒、118 次工具调用、约 40 个模型轮次**。
+复盘后瓶颈很清楚——不是哪个脚本慢，是**轮次太多**：
+
+| 阶段 | 调用数 | 占比 |
+|---|---|---|
+| 分诊 + 读全页 | 13 | 11% |
+| **测量 + 逐行校对** | **~63**（28 次裁剪 + 35 次看图） | **53%** |
+| 建模 | 3 | 3% |
+| **渲染迭代** | **~25**（7 次 Word 渲染） | **21%** |
+| 收尾 | 5 | 4% |
+
+**四条纪律**（按收益排序）：
+
+1. **OCR 先出全文底稿，别靠肉眼读完整篇。** OCR 一次调用给你全文 + 坐标，
+   眼睛只用来裁决它读不准的那几个 token。那次装了 OCR 却全程靠肉眼，纯浪费。
+2. **校对走拼版，一次看完。** 见 Phase 2 的 `verify_sheet.py`。看图调用 35 → 3。
+3. **测量脚本一次成型。** 别写 `measure` → `measure2` → `runs` → `lineext` 四个脚本
+   跨三个阶段取同一批数。**第一个脚本就输出全量**：每页行带 / 每块行数 /
+   行距·段距分布 / 左右极值 / 字号反推。后面只查询，不重写。
+4. **渲染前先跑 `prespec.py`。** 溢出是算术问题，不是渲染问题。那次渲染了 7 次，
+   其中 4 次纯粹在补一个本可提前算出来的溢出。预检到位后 7 → 2。
+
+另有两处小损耗值得防：技能自带脚本报错时**先绕过、顺手记下来**（那次
+`bootstrap.py` 崩了却没第一时间处理）；以及**页面尺寸策略要一开始就定死**
+（原件实测 vs 标准 Letter），别在流程中途反复权衡。
+
+**但有一条不能省**：视觉证词必须**分辨率足够、一次看对**。同一段文字，低分辨率
+裁剪把它读成 `Liqudating`（错），高分辨率才读对 `Liquidating`。结论不是「少看」，
+是「起点就看清 + 批量看」。
+
+## 十、局限（诚实说明）
 
 - 复杂多栏 + 跨栏表格的版面，段落阅读顺序仍可能判错，需要人工/视觉逐页复核。
 - 数学公式会被还原为线性文本，不做公式对象重建。
 - 表格跨页时的拆分逻辑依赖 Word 自身行为，与原 PDF 可能不一致。
 - 图纸、海报这类**以图形为主**的页面，重建的可编辑版本在观感上必然与原图有差距，
   此时应主动与用户确认：要「可编辑」还是「保观感」。
+- 原件里贴边到亚磅级的行，其断行位置对渲染器差异极其敏感；换机器/换字体版本
+  可能出现一两行位移，这是排版引擎固有差异，不是重建错误。
+- 页数**必须自己核**：`compare.py` 只在两端页数相等时逐页比对；原件多出空白页
+  或重建少一页，都会整表错位——先解决页数，再看相似度。

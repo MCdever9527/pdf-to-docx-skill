@@ -3,6 +3,46 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] — 2026-10-07
+
+以一次 5 页扫描件公文的重建复盘为准，把**流程效率**固化成两个新脚本，
+并修掉一个会让自检直接崩掉的缺陷。
+
+### Added
+
+- **`verify_sheet.py`** — 抽检拼版：把需要人眼确认的行带拼成 1~2 张长图，一次看完。
+  支持 `--at` 手工给点 / `--spec` 批量给点 / `--auto` 自动切行带；产出带 `#序号`
+  标尺的拼版图与 `verify_map.json` 对照表。实测把「逐行裁剪 + 逐行读图」的
+  35 次调用压到 3 次。只用 Pillow 实现——**不引入 numpy**（它是本技能的可选依赖）。
+- **`prespec.py`** — 渲染前的高度 / 折行预检，纯算术、不启动 Word。按 `build_docx.py`
+  同一口径估算每页 `Σ(折行数 × 行距) + (段数 − 1) × 段间距`，与「原页实测内容高度」
+  比对，给出 `ok` / `tight` / `overflow` 与建议收缩系数；退出码 1 = 有页溢出。
+  实测把 Word 渲染迭代从 7 次压到 2 次。
+- `SKILL.md` / `README.md` 增补效率纪律章节，以及扫描件（无文字层）的实测基准。
+- 新增踩坑记录：扫描件逐页平移错位的反解方法；Word 默认不做 kerning 导致贴边行
+  提前断行；表格单元格残留空段落撑高边框盒；跨页段落需按原件断点切分；
+  用表格排双栏落款会整块跳页；标签与取值的制表位对齐规律。
+- `SKILL.md` 增加脚本清单表；README 目录结构补全 `measure_ink.py`。
+
+### Fixed
+
+- **`bootstrap.py` 自检直接崩溃**：`_runtime.env_report()` 已把
+  `missing_required` / `missing_optional` 归约成 pip 名称**字符串列表**，
+  `bootstrap.py` 却按 dict 取值（`[d["pip"] for d in …]`），必然抛
+  `TypeError: string indices must be integers`。现已改为直接使用字符串列表，
+  并在两处加了契约说明。
+- **`compare.py` 对无文字层的原件报假指标**：图片型 / 扫描件原文没有文字层，
+  文本相似度取不到基准，旧版会恒返回 `0.000`，把「无法评估」误报成「内容全错」。
+  现在该指标为 `None` 并显示 `N/A`，判定改为只看版面接近度
+  （≤10% pass，≤25% warn），并在结论下方打印一行说明。
+
+### Changed
+
+- **仓库与已部署的技能副本对齐**（此前双向漂移）：
+  `build_docx.py` 取新版（含页眉页脚 PAGE 域、折行估算、制表符支持，
+  比库内版本多约 6.7 KB）；`compare.py` 取新版（扫描件感知）；
+  `measure_ink.py` 补入库。
+
 ## [1.0.0] — 2026-10-07
 
 首个可用版本。核心是「重建而非转码」的完整流水线，以及一套可复现的量化验收方法。

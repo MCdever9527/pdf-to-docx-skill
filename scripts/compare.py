@@ -80,14 +80,23 @@ def side_by_side(a: Image.Image, b: Image.Image, heat: Image.Image,
     return canvas
 
 
-def verdict_for(size_ok: bool, sim: float, pix_ratio: float) -> str:
+def verdict_for(size_ok: bool, sim: float | None, pix_ratio: float) -> str:
     """判定语义（重要：两条指标回答的是不同问题）
 
-    text_similarity  —— 内容保真：文字有没有丢、有没有错。这是硬指标。
+    text_similarity  —— 内容保真：文字有没有丢、有没有错。这是硬指标，
+                        但**仅当原 PDF 有文字层时才有意义**。图片型/扫描件原文
+                        没有文字层，取不到基准，此时该指标为 None，只能靠版面判定。
     pixel_hot_ratio  —— 版面接近度：字体渲染、断行位置、微调间距必然带来像素差，
                         换任何引擎都不可能像素级一致，所以阈值要留出合理余量。
     """
     if not size_ok:
+        return "fail"
+    if sim is None:
+        # 图片型重建：原文无文字层，无法做内容比对，只看版面接近度
+        if pix_ratio <= 0.10:
+            return "pass"
+        if pix_ratio <= 0.25:
+            return "warn"
         return "fail"
     if sim >= 0.995 and pix_ratio <= 0.05:
         return "pass"          # 内容无损且版面几乎重合
@@ -153,7 +162,10 @@ def main() -> int:
 
             ta = pa.get_text("text")
             tb = pb.get_text("text")
-            sim = text_similarity(ta, tb)
+            # 原文没有文字层（图片型/扫描件）时内容相似度没有基准，置为 None。
+            # 否则会得到恒为 0 的假指标，把「无法评估」误报成「内容全错」。
+            orig_has_text = bool(ta.strip())
+            sim_val: float | None = text_similarity(ta, tb) if orig_has_text else None
 
             # 目标尺寸取原页，用于对齐后比较
             target = (int(round(pa.rect.width * args.dpi / 72)),
@@ -166,12 +178,13 @@ def main() -> int:
                 "size_orig_pt": list(sa),
                 "size_result_pt": list(sb),
                 "size_ok": size_ok,
-                "text_similarity": round(sim, 4),
+                "text_similarity": round(sim_val, 4) if sim_val is not None else None,
+                "text_similarity_na": sim_val is None,
                 "text_chars_orig": len(ta.strip()),
                 "text_chars_result": len(tb.strip()),
                 "pixel_mean_diff": round(mean_diff, 4),
                 "pixel_hot_ratio": round(hot_ratio, 4),
-                "verdict": verdict_for(size_ok, sim, hot_ratio),
+                "verdict": verdict_for(size_ok, sim_val, hot_ratio),
             })
 
             if not args.no_images:
@@ -197,14 +210,19 @@ def main() -> int:
         print(f"原始: {a_path.name} ({da.page_count}页)")
         print(f"结果: {b_path.name} ({db.page_count}页)")
         print(f"结论: pass={passes} warn={warns} fail={fails}")
+        if any(p.get("text_similarity_na") for p in pages):
+            print("注: 原文无文字层（图片型/扫描件），文本相似度无基准，以「N/A」表示，"
+                  "判定只看版面接近度。")
         print("-" * 88)
         print(f"{'页':>4} {'判定':<6}{'尺寸':<8}{'文本相似':>10}{'像素均差':>10}{'差异像素':>10}  字符 原/果")
         for p in pages:
             if "verdict" not in p:
                 continue
             size_flag = "OK" if p.get("size_ok") else "MISMATCH"
+            sim_cell = ("       N/A" if p.get("text_similarity_na")
+                        else f"{p.get('text_similarity') or 0:>10.3f}")
             print(f"{p['page']:>4} {p['verdict']:<6}{size_flag:<8}"
-                  f"{p.get('text_similarity', 0):>10.3f}{p.get('pixel_mean_diff', 0):>10.3f}"
+                  f"{sim_cell}{p.get('pixel_mean_diff', 0):>10.3f}"
                   f"{p.get('pixel_hot_ratio', 0):>10.1%}"
                   f"  {p.get('text_chars_orig', 0):>5}/{p.get('text_chars_result', 0):<5}")
         print("-" * 88)
