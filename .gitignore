@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Runtime artifacts produced by this tool
+env.json
+_pdf2docx/
+diff/
+pages/
+_ocr_pages/
+*.blocks.json
+*.ocr.json
+*.probe.json
+
+# Sample / test outputs
+out/
+output/
+*.docx
+*.pdf
+
+# Keep documented examples if you add real ones:
+!examples/**/*.pdf
+!examples/**/*.docx
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
